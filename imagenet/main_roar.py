@@ -16,7 +16,12 @@ import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.models as models
+
 from casme.tasks.imagenet.utils import ImagePathDataset
+from casme.model_basics import casme_load_model
+import casme.casme_utils as casme_utils
+import pyutils.io as io
+
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -75,6 +80,12 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'multi node data parallel training')
 parser.add_argument('--shuffle-targets', action="store_true")
 parser.add_argument('--output-dir', required=True, type=str)
+
+# ROAR
+parser.add_argument('--casm-path', required=True, type=str)
+parser.add_argument('--threshold', required=True, type=float)
+parser.add_argument('--use-p', type=float, default=None)
+
 
 best_acc1 = 0
 
@@ -168,6 +179,12 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             model = torch.nn.DataParallel(model).cuda()
 
+    casm_model = casme_load_model(
+        casm_path=args.casm_path,
+        classifier_load_mode="pickled",
+        verbose=False,
+    )
+
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
@@ -230,7 +247,8 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
-        validate(val_loader, model, criterion, args)
+        validate(val_loader, model, criterion, args, casm_model,
+                 path=os.path.join(args.output_dir, "val_metrics.json"))
         return
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -239,10 +257,15 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, args)
+        train(train_loader, model, criterion, optimizer, epoch, args, casm_model=casm_model)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        save_fol = os.path.join(args.output_dir, f"epoch_{epoch:03d}")
+        os.makedirs(save_fol, exist_ok=True)
+        acc1 = validate(
+            val_loader, model, criterion, args, casm_model,
+            path=os.path.join(save_fol, "val_metrics.json"),
+        )
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -250,16 +273,26 @@ def main_worker(gpu, ngpus_per_node, args):
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
+
             save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer': optimizer.state_dict(),
-            }, is_best, output_dir=args.output_dir)
+            }, is_best, output_dir=save_fol)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def mask_inputs(input_, casm_model, threshold, use_p):
+    with torch.no_grad():
+        mask_in = casme_utils.get_mask(input_, casm_model, use_p=use_p)
+        batch_size = input_.shape[0]
+        cutoff, _ = mask_in.view(batch_size, -1).kthvalue(int(224 * 224 * (1-threshold)))
+        binary_mask_out = (mask_in < cutoff.view(-1, 1, 1, 1)).float()
+        return binary_mask_out * input_
+
+
+def train(train_loader, model, criterion, optimizer, epoch, args, casm_model):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -280,6 +313,12 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         if args.gpu is not None:
             images = images.cuda(args.gpu, non_blocking=True)
+        images = mask_inputs(
+            input_=images,
+            casm_model=casm_model,
+            threshold=args.threshold,
+            use_p=args.use_p,
+        )
         target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
@@ -305,7 +344,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             progress.display(i)
 
 
-def validate(val_loader, model, criterion, args):
+def validate(val_loader, model, criterion, args, casm_model, path):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -323,6 +362,12 @@ def validate(val_loader, model, criterion, args):
         for i, (images, target) in enumerate(val_loader):
             if args.gpu is not None:
                 images = images.cuda(args.gpu, non_blocking=True)
+            images = mask_inputs(
+                input_=images,
+                casm_model=casm_model,
+                threshold=args.threshold,
+                use_p=args.use_p,
+            )
             target = target.cuda(args.gpu, non_blocking=True)
 
             # compute output
@@ -345,8 +390,19 @@ def validate(val_loader, model, criterion, args):
         # TODO: this should also be done with the ProgressMeter
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
+        save_acc(top1=top1, top5=top5, path=path)
 
     return top1.avg
+
+
+def save_acc(top1, top5, path):
+    io.write_json(
+        data={
+            "top1": float(top1.avg),
+            "top5": float(top5.avg),
+        },
+        path=path,
+    )
 
 
 def save_checkpoint(state, is_best, output_dir, filename='checkpoint.pth.tar'):
