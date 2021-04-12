@@ -18,6 +18,8 @@ import torchvision.transforms as transforms
 import torchvision.models as models
 from casme.tasks.imagenet.utils import ImagePathDataset
 
+import pyutils.io as io
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
@@ -230,7 +232,10 @@ def main_worker(gpu, ngpus_per_node, args):
         num_workers=args.workers, pin_memory=True)
 
     if args.evaluate:
-        validate(val_loader, model, criterion, args)
+        validate(
+            val_loader, model, criterion, args,
+            path=os.path.join(args.output_dir, "val_metrics.json")
+        )
         return
 
     for epoch in range(args.start_epoch, args.epochs):
@@ -242,7 +247,12 @@ def main_worker(gpu, ngpus_per_node, args):
         train(train_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        save_fol = os.path.join(args.output_dir, f"epoch_{epoch:03d}")
+        os.makedirs(save_fol, exist_ok=True)
+        acc1 = validate(
+            val_loader, model, criterion, args,
+            path=os.path.join(save_fol, "val_metrics.json"),
+        )
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -256,7 +266,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer': optimizer.state_dict(),
-            }, is_best, output_dir=args.output_dir)
+            }, is_best, output_dir=save_fol)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -305,7 +315,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             progress.display(i)
 
 
-def validate(val_loader, model, criterion, args):
+def validate(val_loader, model, criterion, args, path):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -345,8 +355,19 @@ def validate(val_loader, model, criterion, args):
         # TODO: this should also be done with the ProgressMeter
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
+        save_acc(top1=top1, top5=top5, path=path)
 
     return top1.avg
+
+
+def save_acc(top1, top5, path):
+    io.write_json(
+        data={
+            "top1": float(top1.avg),
+            "top5": float(top5.avg),
+        },
+        path=path,
+    )
 
 
 def save_checkpoint(state, is_best, output_dir, filename='checkpoint.pth.tar'):

@@ -19,7 +19,6 @@ import torchvision.models as models
 
 from casme.tasks.imagenet.utils import ImagePathDataset
 from casme.model_basics import casme_load_model
-import casme.casme_utils as casme_utils
 import pyutils.io as io
 
 
@@ -150,6 +149,12 @@ def main_worker(gpu, ngpus_per_node, args):
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
 
+    casm_model = casme_load_model(
+        casm_path=args.casm_path,
+        classifier_load_mode="pickled",
+        verbose=False,
+    )
+
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
         # should always set the single device scope, otherwise,
@@ -178,12 +183,8 @@ def main_worker(gpu, ngpus_per_node, args):
             model.cuda()
         else:
             model = torch.nn.DataParallel(model).cuda()
-
-    casm_model = casme_load_model(
-        casm_path=args.casm_path,
-        classifier_load_mode="pickled",
-        verbose=False,
-    )
+            casm_model["classifier"] = torch.nn.DataParallel(casm_model["classifier"].cuda()).cuda()
+            casm_model["masker"] = torch.nn.DataParallel(casm_model["masker"].cuda()).cuda()
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
@@ -285,11 +286,55 @@ def main_worker(gpu, ngpus_per_node, args):
 
 def mask_inputs(input_, casm_model, threshold, use_p):
     with torch.no_grad():
-        mask_in = casme_utils.get_mask(input_, casm_model, use_p=use_p)
+        _, logits = get_mask_logits(
+            classifier=casm_model["classifier"],
+            masker=casm_model["masker"],
+            input_=input_,
+            use_p=use_p
+        )
         batch_size = input_.shape[0]
-        cutoff, _ = mask_in.view(batch_size, -1).kthvalue(int(224 * 224 * (1-threshold)))
-        binary_mask_out = (mask_in < cutoff.view(-1, 1, 1, 1)).float()
-        return binary_mask_out * input_
+        cutoff, _ = logits.view(batch_size, -1).kthvalue(int(224 * 224 * (1 - threshold)))
+        binary_mask_out = (logits < cutoff.view(-1, 1, 1, 1)).float()
+        return binary_mask_out * input_, binary_mask_out
+
+
+def get_mask_logits(classifier, masker, input_, use_p):
+    classifier_output, layers = classifier(input_, return_intermediate=True)
+    additional_channels = (
+            masker.maybe_add_prob_layers(layers, use_p)
+            + masker.maybe_add_class_layers(layers, None)
+    )
+
+    layers = masker.append_channels(layers, additional_channels)
+
+    k = []
+    if 0 in masker.use_layers:
+        if masker.use_layers == (0,):
+            k.append(masker.conv1x1_0(layers[0]))
+        else:
+            k.append(layers[0])
+    if 1 in masker.use_layers:
+        k.append(masker.conv1x1_1(layers[1]))
+    if 2 in masker.use_layers:
+        k.append(masker.conv1x1_2(layers[2]))
+    if 3 in masker.use_layers:
+        k.append(masker.conv1x1_3(layers[3]))
+    if 4 in masker.use_layers:
+        k.append(masker.conv1x1_4(layers[4]))
+    final_inputs = torch.cat(k, 1)
+
+    # safety checks cause this is a hack
+    assert isinstance(masker.final[0], nn.Conv2d)
+    assert isinstance(masker.final[1], nn.Sigmoid)
+    assert masker.final[2].__class__.__name__ == "Upsample"
+    assert len(masker.final) == 3
+
+    logits = masker.final[0](final_inputs)
+    big_logits = masker.final[2](logits)
+
+    small_mask = masker.final[1](logits)
+    big_mask = masker.final[2](small_mask)
+    return big_mask, big_logits
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args, casm_model):
@@ -313,7 +358,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args, casm_model):
 
         if args.gpu is not None:
             images = images.cuda(args.gpu, non_blocking=True)
-        images = mask_inputs(
+        images, _ = mask_inputs(
             input_=images,
             casm_model=casm_model,
             threshold=args.threshold,
@@ -362,7 +407,7 @@ def validate(val_loader, model, criterion, args, casm_model, path):
         for i, (images, target) in enumerate(val_loader):
             if args.gpu is not None:
                 images = images.cuda(args.gpu, non_blocking=True)
-            images = mask_inputs(
+            images, _ = mask_inputs(
                 input_=images,
                 casm_model=casm_model,
                 threshold=args.threshold,
